@@ -76,6 +76,7 @@ negotiate an appropriate license for such distribution."
 #endif
 
 #include <cerrno>
+#include <vector>
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -358,7 +359,6 @@ typedef struct {
 } IMDheader;
 
 #define IMDHEADERSIZE 8
-#define IMDVERSION 2
 
 typedef enum IMDType_t {
   IMD_DISCONNECT,   /**< close IMD connection, leaving sim running */
@@ -370,7 +370,13 @@ typedef enum IMDType_t {
   IMD_MDCOMM,       /**< MDComm style force data                   */
   IMD_PAUSE,        /**< pause the running simulation              */
   IMD_TRATE,        /**< set IMD update transmission rate          */
-  IMD_IOERROR       /**< indicate an I/O error                     */
+  IMD_IOERROR,       /**< indicate an I/O error                     */
+  /* IMDv3 only headers */
+  IMD_RESUME,
+  IMD_TIME,
+  IMD_BOX,
+  IMD_VELOCITIES,
+  IMD_FORCES
 } IMDType;          /**< IMD command message type enumerations */
 
 typedef struct {
@@ -386,8 +392,20 @@ typedef struct {
   float Eimpr;      /**< Improper energy, Kcal/mol                 */
 } IMDEnergies;      /**< IMD simulation energy report structure    */
 
+/* IMDv3 only */
+typedef struct IMDSessionInfo {
+  bool time;
+  bool energies;
+  bool box;
+  bool coords;
+  bool velocities;
+  bool forces;
+  bool wrap;
+} IMDSessionInfo;
+
 /** Send control messages - these consist of a header with no subsequent data */
-static int imd_handshake(void *);    /**< check endianness, version compat */
+static int imd_handshake_v2(void *);    /**< check endianness, version compat */
+static int imd_handshake_v3(void *, IMDSessionInfo *);
 /** Receive header and data */
 static IMDType imd_recv_header(void *, int32 *);
 /** Receive MDComm-style forces, units are Kcal/mol/angstrom */
@@ -426,7 +444,7 @@ static void  imdsock_destroy(void *);
  * The implementation follows at the end of the file.          *
  ***************************************************************/
 
-/* struct for packed data communication of coordinates and forces. */
+/* struct for packed data communication of coordinates, velocities, and forces. */
 struct commdata {
   tagint tag;
   float x,y,z;
@@ -434,11 +452,13 @@ struct commdata {
 
 /***************************************************************
  * create class and parse arguments in LAMMPS script. Syntax:
- * fix ID group-ID imd <imd_trate> <imd_port> [unwrap (on|off)] [fscale <imd_fscale>]
+ * fix ID group-ID imd <imd_trate> <imd_port> [version (2|3)] [unwrap (on|off)] [fscale <imd_fscale>] [time (on|off)] [box (on|off)] [coordinates (on|off)] [velocities (on|off)] [forces (on|off)]
  ***************************************************************/
 FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   Fix(lmp, narg, arg)
 {
+  fprintf(screen, "FixIMD() call.\n");
+
   if (narg < 4)
     error->all(FLERR,"Illegal fix imd command");
 
@@ -447,12 +467,21 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
     error->all(FLERR,"Illegal fix imd parameter: port < 1024");
 
   /* default values for optional flags */
+  imd_version = 2;
+  
   unwrap_flag = 0;
   nowait_flag = 0;
   connect_msg = 1;
   imd_fscale = 1.0;
   imd_trate = 1;
 
+  /* IMDv3-only flags. Aren't stored as class attributes since they're converted into IMDSessionInfo */
+  int time_flag = 1;
+  int box_flag = 1;
+  int coord_flag = 1;
+  int vel_flag = 1;
+  int force_flag = 1;
+  
   /* parse optional arguments */
   int iarg = 4;
   while (iarg+1 < narg) {
@@ -464,15 +493,52 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
       imd_fscale = utils::numeric(FLERR,arg[iarg+1],false,lmp);
     } else if (0 == strcmp(arg[iarg], "trate")) {
       imd_trate = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
-    } else {
-      error->all(FLERR,"Unknown fix imd parameter");
-    }
+    } else if (0 == strcmp(arg[iarg], "version")) {
+      imd_version = utils::inumeric(FLERR,arg[iarg+1],false,lmp);
+    } else if (0 == strcmp(arg[iarg], "time")) {
+      time_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+    } else if (0 == strcmp(arg[iarg], "box")) {
+      box_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+    } else if (0 == strcmp(arg[iarg], "coordinates")) {
+      coord_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+    } else if (0 == strcmp(arg[iarg], "velocities")) {
+      vel_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+    } else if (0 == strcmp(arg[iarg], "forces")) {
+      force_flag = utils::logical(FLERR, arg[iarg+1], false, lmp);
+    } else error->all(FLERR,"Unknown fix imd parameter");
     ++iarg; ++iarg;
   }
 
   /* sanity check on parameters */
   if (imd_trate < 1)
     error->all(FLERR,"Illegal fix imd parameter. trate < 1.");
+
+  if (imd_version != 2 && imd_version != 3)
+    error->all(FLERR,"Illegal fix imd parameter. version != 2 or 3.");
+
+  imdsinfo = new IMDSessionInfo;
+
+  /* In IMDv2 in LAMMPS, only coordinates are sent*/
+  if (imd_version == 2) {
+    imdsinfo->time = false;
+    imdsinfo->energies = false;
+    imdsinfo->box = false;
+    imdsinfo->coords = true;
+    imdsinfo->velocities = false;
+    imdsinfo->forces = false; 
+    imdsinfo->wrap = !unwrap_flag;
+  }
+
+  if (imd_version == 3) {
+    imdsinfo->time = time_flag;
+    imdsinfo->energies = false;
+    imdsinfo->box = box_flag;
+    imdsinfo->coords = coord_flag;
+    imdsinfo->velocities = vel_flag;
+    imdsinfo->forces = force_flag;
+    imdsinfo->wrap = !unwrap_flag;
+  }
+
 
   bigint n = group->count(igroup);
   if (n > MAXSMALLINT) error->all(FLERR,"Too many atoms for fix imd");
@@ -487,13 +553,33 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   imd_inactive = 0;
   imd_terminate = 0;
   imd_forces = 0;
-  force_buf = nullptr;
+  recv_force_buf = nullptr;
   maxbuf = 0;
-  msgdata = nullptr;
-  msglen = 0;
-  comm_buf = nullptr;
+  coord_data = nullptr;
+  vel_data = nullptr;
+  force_data = nullptr;
   idmap = nullptr;
   rev_idmap = nullptr;
+
+  
+  msglen = 0;
+  if (imdsinfo->time) {
+    msglen += 4+IMDHEADERSIZE;
+  }
+  if (imdsinfo->box) {
+    msglen += 9*4+IMDHEADERSIZE;
+  }
+  if (imdsinfo->coords) {
+    msglen += 3*4*num_coords+IMDHEADERSIZE;
+  }
+  if (imdsinfo->velocities) {
+    msglen += 3*4*num_coords+IMDHEADERSIZE;
+  }
+  if (imdsinfo->forces) {
+    msglen += 3*4*num_coords+IMDHEADERSIZE;
+  }
+  fprintf(screen, "num_coods: %d\n", num_coords);
+  msgdata = new char[msglen];
 
   if (me == 0) {
     /* set up incoming socket on MPI rank 0. */
@@ -512,7 +598,7 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   if (imd_terminate)
     error->all(FLERR,"LAMMPS Terminated on error in IMD.");
 
-  /* storage required to communicate a single coordinate or force. */
+  /* storage required to communicate a single coordinate, velocity, or force. */
   size_one = sizeof(struct commdata);
 
 #if defined(LAMMPS_ASYNC_IMD)
@@ -546,7 +632,7 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
  *********************************/
 FixIMD::~FixIMD()
 {
-
+fprintf(screen, "destructor called\n");
 #if defined(LAMMPS_ASYNC_IMD)
   if (me == 0) {
     pthread_mutex_lock(&write_mutex);
@@ -563,11 +649,21 @@ FixIMD::~FixIMD()
 #endif
 
   auto hashtable = (taginthash_t *)idmap;
-  memory->destroy(comm_buf);
-  memory->destroy(force_buf);
+  if (imdsinfo->coords) {
+    memory->destroy(coord_data);
+  }
+  if (imdsinfo->velocities) {
+    memory->destroy(vel_data);
+  }
+  if (imdsinfo->forces) {
+    memory->destroy(force_data);
+  }
+  memory->destroy(msgdata);
+  memory->destroy(recv_force_buf);
   taginthash_destroy(hashtable);
   delete hashtable;
   free(rev_idmap);
+  free(imdsinfo);
   // close sockets
   imdsock_shutdown(clientsock);
   imdsock_destroy(clientsock);
@@ -575,6 +671,7 @@ FixIMD::~FixIMD()
   imdsock_destroy(localsock);
   clientsock=nullptr;
   localsock=nullptr;
+  fprintf(screen, "destructor done\n");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -599,6 +696,7 @@ void FixIMD::init()
    new connection was made, 0 if not. */
 int FixIMD::reconnect()
 {
+  fprintf(screen, "reconnect() call.\n");
   /* set up IMD communication, but only if needed. */
   imd_inactive = 0;
   imd_terminate = 0;
@@ -637,7 +735,8 @@ int FixIMD::reconnect()
       return 0;
     } else {
       /* check endianness and IMD protocol version. */
-      if (imd_handshake(clientsock)) {
+      if ((imd_version == 2 && imd_handshake_v2(clientsock)) ||
+          (imd_version == 3 && imd_handshake_v3(clientsock, imdsinfo))) {
         if (screen)
           fprintf(screen, "IMD handshake error. Dropping connection.\n");
         imdsock_destroy(clientsock);
@@ -680,9 +779,21 @@ void FixIMD::setup(int)
     if (mask[i] & groupbit) ++nme;
 
   MPI_Allreduce(&nme,&nmax,1,MPI_INT,MPI_MAX,world);
-  memory->destroy(comm_buf);
+ 
   maxbuf = nmax*size_one;
-  comm_buf = (void *) memory->smalloc(maxbuf,"imd:comm_buf");
+
+  if (imdsinfo->coords) {
+    memory->destroy(coord_data);
+    coord_data = (void *) memory->smalloc(maxbuf,"imd:coord_data");
+  }
+  if (imdsinfo->velocities) {
+    memory->destroy(vel_data);
+    vel_data = (void *) memory->smalloc(maxbuf,"imd:vel_data");
+  }
+  if (imdsinfo->forces) {
+    memory->destroy(force_data);
+    force_data = (void *) memory->smalloc(maxbuf,"imd:force_data");
+  }
 
   connect_msg = 1;
   reconnect();
@@ -697,11 +808,11 @@ void FixIMD::setup(int)
   idmap = (void *)hashtable;
 
   int tmp, ndata;
-  auto buf = static_cast<struct commdata *>(comm_buf);
+  auto buf = static_cast<struct commdata *>(coord_data);
 
   if (me == 0) {
-    MPI_Status status;
-    MPI_Request request;
+    std::vector<MPI_Status> statuses;
+    std::vector<MPI_Request> requests;
     auto taglist = new tagint[num_coords];
     int numtag=0; /* counter to map atom tags to a 0-based consecutive index list */
 
@@ -714,15 +825,39 @@ void FixIMD::setup(int)
 
     /* loop over procs to receive remote data */
     for (i=1; i < comm->nprocs; ++i) {
-      MPI_Irecv(comm_buf, maxbuf, MPI_BYTE, i, 0, world, &request);
-      MPI_Send(&tmp, 0, MPI_INT, i, 0, world);
-      MPI_Wait(&request, &status);
-      MPI_Get_count(&status, MPI_BYTE, &ndata);
-      ndata /= size_one;
+      /* We're assuming tags are consistent across x,v,f */
+      bool tag_recvd = false;
+      statuses.clear();
+      requests.clear();
 
-      for (j=0; j < ndata; ++j) {
-        taglist[numtag] = buf[j].tag;
-        ++numtag;
+      if (imdsinfo->coords) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(coord_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      if (imdsinfo->velocities) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      if (imdsinfo->forces) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      statuses.resize(requests.size());
+      MPI_Send(&tmp, 0, MPI_INT, i, 0, world);
+      MPI_Waitall(requests.size(), requests.data(), statuses.data());
+
+      for (size_t k=0; k < statuses.size(); ++k) {
+        if (!tag_recvd) {
+          MPI_Get_count(&statuses[k], MPI_BYTE, &ndata);
+          ndata /= size_one;
+          for (j=0; j < ndata; ++j) {
+            taglist[numtag] = buf[j].tag;
+            ++numtag;
+          }
+          tag_recvd = true;
+        } else {
+          break;
+        }
       }
     }
 
@@ -747,7 +882,15 @@ void FixIMD::setup(int)
     }
     /* blocking receive to wait until it is our turn to send data. */
     MPI_Recv(&tmp, 0, MPI_INT, 0, 0, world, MPI_STATUS_IGNORE);
-    MPI_Rsend(comm_buf, nme*size_one, MPI_BYTE, 0, 0, world);
+    if (imdsinfo->coords) {
+      MPI_Rsend(coord_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
+    if (imdsinfo->velocities) {
+      MPI_Rsend(vel_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
+    if (imdsinfo->forces) {
+      MPI_Rsend(force_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
   }
 
   }
@@ -795,6 +938,34 @@ void FixIMD::ioworker()
  * Send coodinates, energies, and add IMD forces to atoms. */
 void FixIMD::post_force(int /*vflag*/)
 {
+
+  if (imd_version == 2) {
+    handle_step_v2();
+  }
+  else if (imd_version == 3) {
+    handle_step_v3();
+  }
+
+  }
+
+/* ---------------------------------------------------------------------- */
+void FixIMD::post_force_respa(int vflag, int ilevel, int /*iloop*/)
+{
+  /* only process IMD on the outmost RESPA level. */
+  if (ilevel == nlevels_respa-1) post_force(vflag);
+}
+
+/* ---------------------------------------------------------------------- */
+/* local memory usage. approximately. */
+double FixIMD::memory_usage()
+{
+  return static_cast<double>(num_coords+maxbuf+imd_forces)*size_one;
+}
+
+void FixIMD::handle_step_v2() {
+
+  fprintf(screen, "handle_step_v2() call.\n");
+
   /* check for reconnect */
   if (imd_inactive) {
     reconnect();
@@ -813,6 +984,8 @@ void FixIMD::post_force(int /*vflag*/)
   int *mask  = atom->mask;
   struct commdata *buf;
 
+  fprintf(screen, "finsihed setting vars.\n");
+
   if (me == 0) {
     /* process all pending incoming data. */
     int imd_paused=0;
@@ -825,22 +998,12 @@ void FixIMD::post_force(int /*vflag*/)
 
       switch(msg) {
 
-        case IMD_GO:
-          if (screen)
-            fprintf(screen, "Ignoring unexpected IMD_GO message.\n");
-          break;
-
-        case IMD_IOERROR:
-          if (screen)
-            fprintf(screen, "IMD connection lost.\n");
-          /* fallthrough */
-
         case IMD_DISCONNECT: {
           /* disconnect from client. wait for new connection. */
           imd_paused = 0;
           imd_forces = 0;
-          memory->destroy(force_buf);
-          force_buf = nullptr;
+          memory->destroy(recv_force_buf);
+          recv_force_buf = nullptr;
           imdsock_destroy(clientsock);
           clientsock = nullptr;
           if (screen)
@@ -866,9 +1029,9 @@ void FixIMD::post_force(int /*vflag*/)
         case IMD_PAUSE:
           /* pause the running simulation. wait for second IMD_PAUSE to continue. */
           if (imd_paused) {
-            if (screen)
-              fprintf(screen, "Continuing run on IMD client request.\n");
-            imd_paused = 0;
+              if (screen)
+                fprintf(screen, "Continuing run on IMD client request.\n");
+              imd_paused = 0;
           } else {
             if (screen)
               fprintf(screen, "Pausing run on IMD client request.\n");
@@ -884,31 +1047,18 @@ void FixIMD::post_force(int /*vflag*/)
             fprintf(screen, "IMD client requested change of transfer rate. Now it is %d.\n", imd_trate);
           break;
 
-        case IMD_ENERGIES: {
-          IMDEnergies dummy_energies;
-          imd_recv_energies(clientsock, &dummy_energies);
-          break;
-        }
-
-        case IMD_FCOORDS: {
-          auto dummy_coords = new float[3*length];
-          imd_recv_fcoords(clientsock, length, dummy_coords);
-          delete[] dummy_coords;
-          break;
-        }
-
         case IMD_MDCOMM: {
           auto imd_tags = new int32[length];
           auto imd_fdat = new float[3*length];
           imd_recv_mdcomm(clientsock, length, imd_tags, imd_fdat);
 
           if (imd_forces < length) { /* grow holding space for forces, if needed. */
-            memory->destroy(force_buf);
-            force_buf = (void *) memory->smalloc((bigint)length*size_one,
-                                                 "imd:force_buf");
+            memory->destroy(recv_force_buf);
+            recv_force_buf = (void *) memory->smalloc((bigint)length*size_one,
+                                                 "imd:recv_force_buf");
           }
           imd_forces = length;
-          buf = static_cast<struct commdata *>(force_buf);
+          buf = static_cast<struct commdata *>(recv_force_buf);
 
           /* compare data to hash table */
           for (int ii=0; ii < length; ++ii) {
@@ -930,6 +1080,8 @@ void FixIMD::post_force(int /*vflag*/)
     }
   }
 
+  fprintf(screen, "finished receiving commands.\n");
+
   /* update all tasks with current settings. */
   int old_imd_forces = imd_forces;
   MPI_Bcast(&imd_trate, 1, MPI_INT, 0, world);
@@ -943,13 +1095,15 @@ void FixIMD::post_force(int /*vflag*/)
     /* check if we need to readjust the forces comm buffer on the receiving nodes. */
     if (me != 0) {
       if (old_imd_forces < imd_forces) { /* grow holding space for forces, if needed. */
-        if (force_buf != nullptr)
-          memory->sfree(force_buf);
-        force_buf = memory->smalloc((bigint)imd_forces*size_one, "imd:force_buf");
+        if (recv_force_buf != nullptr)
+          memory->sfree(recv_force_buf);
+        recv_force_buf = memory->smalloc((bigint)imd_forces*size_one, "imd:recv_force_buf");
       }
     }
-    MPI_Bcast(force_buf, imd_forces*size_one, MPI_BYTE, 0, world);
+    MPI_Bcast(recv_force_buf, imd_forces*size_one, MPI_BYTE, 0, world);
   }
+
+  fprintf(screen, "finished updating tasks.\n");
 
   /* Check if we need to communicate coordinates to the client.
    * Tuning imd_trate allows to keep the overhead for IMD low
@@ -961,7 +1115,7 @@ void FixIMD::post_force(int /*vflag*/)
   if (update->ntimestep % imd_trate) {
     if (imd_forces > 0) {
       double **f = atom->f;
-      buf = static_cast<struct commdata *>(force_buf);
+      buf = static_cast<struct commdata *>(recv_force_buf);
 
       /* XXX. this is in principle O(N**2) == not good.
        * however we assume for now that the number of atoms
@@ -989,27 +1143,32 @@ void FixIMD::post_force(int /*vflag*/)
 
   MPI_Allreduce(&nme,&nmax,1,MPI_INT,MPI_MAX,world);
   if (nmax*size_one > maxbuf) {
-    memory->destroy(comm_buf);
+    memory->destroy(coord_data);
     maxbuf = nmax*size_one;
-    comm_buf = memory->smalloc(maxbuf,"imd:comm_buf");
+    coord_data = memory->smalloc(maxbuf,"imd:coord_data");
   }
 
   int tmp, ndata;
-  buf = static_cast<struct commdata *>(comm_buf);
+  buf = static_cast<struct commdata *>(coord_data);
+
+  fprintf(screen, "finished growing buffs.\n");
 
   if (me == 0) {
+    fprintf(screen, "entering root-only\n");
     MPI_Status status;
     MPI_Request request;
     /* collect data into new array. we bypass the IMD API to save
      * us one extra copy of the data. */
-    msglen = 3*sizeof(float)*num_coords+IMDHEADERSIZE;
-    msgdata = new char[msglen];
+    fprintf(screen, "filling coordheader\n");
     imd_fill_header((IMDheader *)msgdata, IMD_FCOORDS, num_coords);
+    fprintf(screen, "coord header filled\n");
     /* array pointer, to the offset where we receive the coordinates. */
     auto recvcoord = (float *) (msgdata+IMDHEADERSIZE);
+    fprintf(screen, "buf recast\n");
 
     /* add local data */
-    if (unwrap_flag) {
+    if (!imdsinfo->wrap) {
+      fprintf(screen, "adding local data\n");
       double xprd = domain->xprd;
       double yprd = domain->yprd;
       double zprd = domain->zprd;
@@ -1049,10 +1208,10 @@ void FixIMD::post_force(int /*vflag*/)
         }
       }
     }
-
+    fprintf(screen, "local data added\n");
     /* loop over procs to receive remote data */
     for (i=1; i < comm->nprocs; ++i) {
-      MPI_Irecv(comm_buf, maxbuf, MPI_BYTE, i, 0, world, &request);
+      MPI_Irecv(coord_data, maxbuf, MPI_BYTE, i, 0, world, &request);
       MPI_Send(&tmp, 0, MPI_INT, i, 0, world);
       MPI_Wait(&request, &status);
       MPI_Get_count(&status, MPI_BYTE, &ndata);
@@ -1067,7 +1226,7 @@ void FixIMD::post_force(int /*vflag*/)
         }
       }
     }
-
+    fprintf(screen, "remote data added\n");
     /* done collecting frame data now communicate with IMD client. */
 
 #if defined(LAMMPS_ASYNC_IMD)
@@ -1078,10 +1237,12 @@ void FixIMD::post_force(int /*vflag*/)
     pthread_mutex_unlock(&write_mutex);
 #else
     /* send coordinate data, if client is able to accept */
+    fprintf(screen, "sending data\n");
+    fprintf(screen, "num_coords is %i\n", num_coords);
     if (clientsock && imdsock_selwrite(clientsock,0)) {
       imd_writen(clientsock, msgdata, msglen);
     }
-    delete[] msgdata;
+    fprintf(screen, "data sent\n");
 #endif
 
   } else {
@@ -1128,23 +1289,512 @@ void FixIMD::post_force(int /*vflag*/)
     }
     /* blocking receive to wait until it is our turn to send data. */
     MPI_Recv(&tmp, 0, MPI_INT, 0, 0, world, MPI_STATUS_IGNORE);
-    MPI_Rsend(comm_buf, nme*size_one, MPI_BYTE, 0, 0, world);
+    MPI_Rsend(coord_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    fprintf(screen, "entering non-root-only\n");
   }
 
-  }
-
-/* ---------------------------------------------------------------------- */
-void FixIMD::post_force_respa(int vflag, int ilevel, int /*iloop*/)
-{
-  /* only process IMD on the outmost RESPA level. */
-  if (ilevel == nlevels_respa-1) post_force(vflag);
 }
 
-/* ---------------------------------------------------------------------- */
-/* local memory usage. approximately. */
-double FixIMD::memory_usage()
-{
-  return static_cast<double>(num_coords+maxbuf+imd_forces)*size_one;
+void FixIMD::handle_step_v3() {
+  // IMDV3
+
+  fprintf(screen, "handle_step_v3() call.\n");
+  /* check for reconnect */
+  if (imd_inactive) {
+    reconnect();
+    MPI_Bcast(&imd_inactive, 1, MPI_INT, 0, world);
+    MPI_Bcast(&imd_terminate, 1, MPI_INT, 0, world);
+    if (imd_terminate)
+      error->all(FLERR,"LAMMPS terminated on error in setting up IMD connection.");
+    if (imd_inactive)
+      return;     /* IMD client has detached and not yet come back. do nothing. */
+  }
+
+  tagint *tag = atom->tag;
+  double **x = atom->x;
+  double **v = atom->v;
+  double **f = atom->f;
+  imageint *image = atom->image;
+  int nlocal = atom->nlocal;
+  int *mask  = atom->mask;
+  struct commdata *buf;
+
+  if (me == 0) {
+    /* process all pending incoming data. */
+    int imd_paused=0;
+    while ((imdsock_selread(clientsock, 0) > 0) || imd_paused) {
+      /* if something requested to turn off IMD while paused get out */
+      if (imd_inactive) break;
+
+      int32 length;
+      int msg = imd_recv_header(clientsock, &length);
+
+      switch(msg) {
+
+        case IMD_DISCONNECT: {
+          /* disconnect from client. wait for new connection. */
+          imd_paused = 0;
+          imd_forces = 0;
+          memory->destroy(recv_force_buf);
+          recv_force_buf = nullptr;
+          imdsock_destroy(clientsock);
+          clientsock = nullptr;
+          if (screen)
+            fprintf(screen, "IMD client detached. LAMMPS run continues.\n");
+
+          connect_msg = 1;
+          reconnect();
+          if (imd_terminate) imd_inactive = 1;
+          break;
+        }
+
+        case IMD_KILL:
+          /* stop the simulation job and shutdown IMD */
+          if (screen)
+            fprintf(screen, "IMD client requested termination of run.\n");
+          imd_inactive = 1;
+          imd_terminate = 1;
+          imd_paused = 0;
+          imdsock_destroy(clientsock);
+          clientsock = nullptr;
+          break;
+
+        case IMD_PAUSE:
+          /* pause the running simulation. wait for second IMD_PAUSE to continue. */
+          if (!imd_paused) {
+            if (screen)
+              fprintf(screen, "Pausing run on IMD client request.\n");
+            imd_paused = 1;
+          } else {
+            // Pause in IMDv3 is idempotent
+            continue;
+          }
+          break;
+        
+        case IMD_RESUME:
+          /* resume the running simulation. */
+          if (imd_paused) {
+            if (screen)
+              fprintf(screen, "Continuing run on IMD client request.\n");
+            imd_paused = 0;
+          } else {
+            // Resume in IMDv3 is idempotent
+            continue;
+          }
+          break;
+
+        case IMD_TRATE:
+          /* change the IMD transmission data rate */
+          if (length > 0)
+            imd_trate = length;
+          if (screen)
+            fprintf(screen, "IMD client requested change of transfer rate. Now it is %d.\n", imd_trate);
+          break;
+
+        case IMD_MDCOMM: {
+          auto imd_tags = new int32[length];
+          auto imd_fdat = new float[3*length];
+          imd_recv_mdcomm(clientsock, length, imd_tags, imd_fdat);
+
+          if (imd_forces < length) { /* grow holding space for forces, if needed. */
+            memory->destroy(recv_force_buf);
+            recv_force_buf = (void *) memory->smalloc((bigint)length*size_one,
+                                                 "imd:recv_force_buf");
+          }
+          imd_forces = length;
+          buf = static_cast<struct commdata *>(recv_force_buf);
+
+          /* compare data to hash table */
+          for (int ii=0; ii < length; ++ii) {
+            buf[ii].tag = rev_idmap[imd_tags[ii]];
+            buf[ii].x   = imd_fdat[3*ii];
+            buf[ii].y   = imd_fdat[3*ii+1];
+            buf[ii].z   = imd_fdat[3*ii+2];
+          }
+          delete[] imd_tags;
+          delete[] imd_fdat;
+          break;
+        }
+
+        default:
+          if (screen)
+            fprintf(screen, "Unhandled incoming IMD message #%d. length=%d\n", msg, length);
+          break;
+      }
+    }
+  }
+
+  /* update all tasks with current settings. */
+  int old_imd_forces = imd_forces;
+  MPI_Bcast(&imd_trate, 1, MPI_INT, 0, world);
+  MPI_Bcast(&imd_inactive, 1, MPI_INT, 0, world);
+  MPI_Bcast(&imd_forces, 1, MPI_INT, 0, world);
+  MPI_Bcast(&imd_terminate, 1, MPI_INT, 0, world);
+  if (imd_terminate)
+    error->all(FLERR,"LAMMPS terminated on IMD request.");
+
+  fprintf(screen, "tasks updated.\n");
+
+  if (imd_forces > 0) {
+    /* check if we need to readjust the forces comm buffer on the receiving nodes. */
+    if (me != 0) {
+      if (old_imd_forces < imd_forces) { /* grow holding space for forces, if needed. */
+        if (recv_force_buf != nullptr)
+          memory->sfree(recv_force_buf);
+        recv_force_buf = memory->smalloc((bigint)imd_forces*size_one, "imd:recv_force_buf");
+      }
+    }
+    MPI_Bcast(recv_force_buf, imd_forces*size_one, MPI_BYTE, 0, world);
+  }
+
+  /* Check if we need to communicate coordinates to the client.
+   * Tuning imd_trate allows to keep the overhead for IMD low
+   * at the expense of a more jumpy display. Rather than using
+   * end_of_step() we do everything here in one go.
+   *
+   * If we don't communicate, only check if we have forces
+   * stored away and apply them. */
+  if (update->ntimestep % imd_trate) {
+    if (imd_forces > 0) {
+      buf = static_cast<struct commdata *>(recv_force_buf);
+
+      /* XXX. this is in principle O(N**2) == not good.
+       * however we assume for now that the number of atoms
+       * that we manipulate via IMD will be small compared
+       * to the total system size, so we don't hurt too much. */
+      for (int j=0; j < imd_forces; ++j) {
+        for (int i=0; i < nlocal; ++i) {
+          if (mask[i] & groupbit) {
+            if (buf[j].tag == tag[i]) {
+              f[i][0] += imd_fscale*buf[j].x;
+              f[i][1] += imd_fscale*buf[j].y;
+              f[i][2] += imd_fscale*buf[j].z;
+            }
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  /* check and potentially grow local communication buffers. */
+  int i, k, nmax, nme=0;
+  for (i=0; i < nlocal; ++i)
+    if (mask[i] & groupbit) ++nme;
+  
+  MPI_Allreduce(&nme,&nmax,1,MPI_INT,MPI_MAX,world);
+  if (nmax*size_one > maxbuf) {
+    maxbuf = nmax*size_one;
+    if (imdsinfo->coords) {
+      memory->destroy(coord_data);
+      coord_data = memory->smalloc(maxbuf,"imd:coord_data");
+    }
+    if (imdsinfo->velocities) {
+      memory->destroy(vel_data);
+      vel_data = memory->smalloc(maxbuf,"imd:vel_data");
+    }
+    if (imdsinfo->forces) {
+      memory->destroy(force_data);
+      force_data = memory->smalloc(maxbuf,"imd:force_data");
+    }
+  }
+
+  int tmp, ndata;
+
+  if (me == 0) {
+    MPI_Status status;
+    MPI_Request request;
+
+    float * recvcoord = nullptr;
+    float * recvvel = nullptr;
+    float * recvforce = nullptr;
+
+    int offset = 0;
+    if (imdsinfo->time) {
+      imd_fill_header((IMDheader *)msgdata, IMD_TIME, 0);
+      ((float *)(msgdata+IMDHEADERSIZE))[0] = update->dt;
+      float currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
+      ((float *)(msgdata+IMDHEADERSIZE))[1] = currtime;
+      offset += 8+IMDHEADERSIZE;
+      fprintf(screen, "time header filled with %f %f\n", update->dt, currtime);
+    }
+    if (imdsinfo->box) {
+      imd_fill_header((IMDheader *)(msgdata + offset), IMD_BOX, 0);
+      // Get triclinic box vectors
+      float *box = (float *)(msgdata+offset+IMDHEADERSIZE);
+      box[0] = domain->h[0];
+      box[1] = 0.0;
+      box[2] = 0.0;
+      box[3] = domain->h[5];
+      box[4] = domain->h[1];
+      box[5] = 0.0;
+      box[6] = domain->h[4];
+      box[7] = domain->h[3];
+      box[8] = domain->h[2];
+      
+      fprintf(screen, "box header filled with %f\n", domain->h[0]);
+      offset += 9*4+IMDHEADERSIZE;
+      
+    }
+    if (imdsinfo->coords) {
+      imd_fill_header((IMDheader *)(msgdata + offset), IMD_FCOORDS, num_coords);
+      recvcoord = (float *) (msgdata + offset + IMDHEADERSIZE);
+      offset += 3*4*num_coords+IMDHEADERSIZE;
+    }
+    if (imdsinfo->velocities) {
+      imd_fill_header((IMDheader *)(msgdata + offset), IMD_VELOCITIES, num_coords);
+      recvvel = (float *) (msgdata + offset + IMDHEADERSIZE);
+      offset += 3*4*num_coords+IMDHEADERSIZE;
+    }
+    if (imdsinfo->forces) {
+      imd_fill_header((IMDheader *)(msgdata + offset), IMD_FORCES, num_coords);
+      recvforce = (float *) (msgdata + offset + IMDHEADERSIZE);
+      offset += 3*4*num_coords+IMDHEADERSIZE;
+    }
+
+    fprintf(screen, "finished calculating offsets.\n");
+
+    /* add local data */
+    if (imdsinfo->coords) {
+      if (!imdsinfo->wrap) {
+        double xprd = domain->xprd;
+        double yprd = domain->yprd;
+        double zprd = domain->zprd;
+        double xy = domain->xy;
+        double xz = domain->xz;
+        double yz = domain->yz;
+
+        for (i=0; i<nlocal; ++i) {
+          if (mask[i] & groupbit) {
+            const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
+            if (j != 3*HASH_FAIL) {
+
+              if (imdsinfo->coords) {
+                int ix = (image[i] & IMGMASK) - IMGMAX;
+                int iy = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
+                int iz = (image[i] >> IMG2BITS) - IMGMAX;
+
+                if (domain->triclinic) {
+                  recvcoord[j]   = x[i][0] + ix * xprd + iy * xy + iz * xz;
+                  recvcoord[j+1] = x[i][1] + iy * yprd + iz * yz;
+                  recvcoord[j+2] = x[i][2] + iz * zprd;
+                } else {
+                  recvcoord[j]   = x[i][0] + ix * xprd;
+                  recvcoord[j+1] = x[i][1] + iy * yprd;
+                  recvcoord[j+2] = x[i][2] + iz * zprd;
+                }
+              }
+            }
+          }
+        }
+      } else {
+        for (i=0; i<nlocal; ++i) {
+          if (mask[i] & groupbit) {
+            const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
+            if (j != 3*HASH_FAIL) {
+              recvcoord[j]   = x[i][0];
+              recvcoord[j+1] = x[i][1];
+              recvcoord[j+2] = x[i][2];
+            }
+          }
+        }
+      }
+    }
+    if (imdsinfo->velocities) {
+      for (i=0; i<nlocal; ++i) {
+        if (mask[i] & groupbit) {
+          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
+          if (j != 3*HASH_FAIL) {
+            recvvel[j]   = v[i][0];
+            recvvel[j+1] = v[i][1];
+            recvvel[j+2] = v[i][2];
+          }
+        }
+      }
+    }
+    if (imdsinfo->forces) {
+      for (i=0; i<nlocal; ++i) {
+        if (mask[i] & groupbit) {
+          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
+          if (j != 3*HASH_FAIL) {
+            recvforce[j]   = f[i][0];
+            recvforce[j+1] = f[i][1];
+            recvforce[j+2] = f[i][2];
+          }
+        }
+      }
+    }
+
+    /* loop over procs to receive remote coord data */
+    std::vector<MPI_Status> statuses;
+    std::vector<MPI_Request> requests;
+    for (i=1; i < comm->nprocs; ++i) {
+      statuses.clear();
+      requests.clear();
+      if (imdsinfo->coords) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(coord_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      if (imdsinfo->velocities) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      if (imdsinfo->forces) {
+        requests.push_back(MPI_Request());
+        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+      }
+      statuses.resize(requests.size());
+      MPI_Send(&tmp, 0, MPI_INT, i, 0, world);
+      MPI_Waitall(requests.size(), requests.data(), statuses.data());
+
+      if (imdsinfo->coords) {
+        buf = static_cast<struct commdata *>(coord_data);
+        MPI_Status status = statuses.front();
+        statuses.erase(statuses.begin());
+        MPI_Get_count(&status, MPI_BYTE, &ndata);
+        buf = static_cast<struct commdata *>(coord_data);
+        ndata /= size_one;
+        for (k=0; k<ndata; ++k) {
+          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
+          if (j != 3*HASH_FAIL) {
+            recvcoord[j]   = buf[k].x;
+            recvcoord[j+1] = buf[k].y;
+            recvcoord[j+2] = buf[k].z;
+          }
+        }
+      }
+      if (imdsinfo->velocities) {
+        buf = static_cast<struct commdata *>(vel_data);
+        MPI_Status status = statuses.front();
+        statuses.erase(statuses.begin());
+        MPI_Get_count(&status, MPI_BYTE, &ndata);
+        buf = static_cast<struct commdata *>(vel_data);
+        ndata /= size_one;
+        for (k=0; k<ndata; ++k) {
+          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
+          if (j != 3*HASH_FAIL) {
+            recvvel[j]   = buf[k].x;
+            recvvel[j+1] = buf[k].y;
+            recvvel[j+2] = buf[k].z;
+          }
+        }
+      }
+      if (imdsinfo->forces) {
+        buf = static_cast<struct commdata *>(force_data);
+        MPI_Status status = statuses.front();
+        statuses.erase(statuses.begin());
+        MPI_Get_count(&status, MPI_BYTE, &ndata);
+        buf = static_cast<struct commdata *>(force_data);
+        ndata /= size_one;
+        for (k=0; k<ndata; ++k) {
+          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
+          if (j != 3*HASH_FAIL) {
+            recvforce[j]   = buf[k].x;
+            recvforce[j+1] = buf[k].y;
+            recvforce[j+2] = buf[k].z;
+          }
+        }
+      
+      }
+      }
+
+    /* done collecting frame data now communicate with IMD client. */
+
+#if defined(LAMMPS_ASYNC_IMD)
+    /* wake up i/o worker thread and release lock on i/o buffer
+     * we can go back to our MD and let the i/o thread do the rest */
+    buf_has_data=1;
+    pthread_cond_signal(&write_cond);
+    pthread_mutex_unlock(&write_mutex);
+#else
+    /* send coordinate data, if client is able to accept */
+    if (clientsock && imdsock_selwrite(clientsock,0)) {
+      imd_writen(clientsock, msgdata, msglen);
+    }
+#endif
+
+  } else {
+    /* copy xvf data into communication buffer */
+    nme = 0;
+    if (imdsinfo->coords) {
+      buf = static_cast<struct commdata *>(coord_data);
+      if (unwrap_flag) {
+        double xprd = domain->xprd;
+        double yprd = domain->yprd;
+        double zprd = domain->zprd;
+        double xy = domain->xy;
+        double xz = domain->xz;
+        double yz = domain->yz;
+
+        for (i=0; i<nlocal; ++i) {
+          if (mask[i] & groupbit) {
+            int ix = (image[i] & IMGMASK) - IMGMAX;
+            int iy = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
+            int iz = (image[i] >> IMG2BITS) - IMGMAX;
+
+            if (domain->triclinic) {
+              buf[nme].tag = tag[i];
+              buf[nme].x   = x[i][0] + ix * xprd + iy * xy + iz * xz;
+              buf[nme].y   = x[i][1] + iy * yprd + iz * yz;
+              buf[nme].z   = x[i][2] + iz * zprd;
+            } else {
+              buf[nme].tag = tag[i];
+              buf[nme].x   = x[i][0] + ix * xprd;
+              buf[nme].y   = x[i][1] + iy * yprd;
+              buf[nme].z   = x[i][2] + iz * zprd;
+            }
+            ++nme;
+          }
+        }
+      } else {
+        for (i=0; i<nlocal; ++i) {
+          if (mask[i] & groupbit) {
+            buf[nme].tag = tag[i];
+            buf[nme].x   = x[i][0];
+            buf[nme].y   = x[i][1];
+            buf[nme].z   = x[i][2];
+            ++nme;
+          }
+        }
+      }
+    }
+    if (imdsinfo->velocities) {
+      buf = static_cast<struct commdata *>(vel_data);
+      for (i=0; i<nlocal; ++i) {
+        if (mask[i] & groupbit) {
+          buf[nme].tag = tag[i];
+          buf[nme].x   = v[i][0];
+          buf[nme].y   = v[i][1];
+          buf[nme].z   = v[i][2];
+          ++nme;
+        }
+      }
+    }
+    if (imdsinfo->forces) {
+      for (i=0; i<nlocal; ++i) {
+        if (mask[i] & groupbit) {
+          buf[nme].tag = tag[i];
+          buf[nme].x   = f[i][0];
+          buf[nme].y   = f[i][1];
+          buf[nme].z   = f[i][2];
+          ++nme;
+        }
+      }
+
+    }
+    /* blocking receive to wait until it is our turn to send data. */
+    MPI_Recv(&tmp, 0, MPI_INT, 0, 0, world, MPI_STATUS_IGNORE);
+    if (imdsinfo->coords) {
+      MPI_Rsend(coord_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
+    if (imdsinfo->velocities) {
+      MPI_Rsend(vel_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
+    if (imdsinfo->forces) {
+      MPI_Rsend(force_data, nme*size_one, MPI_BYTE, 0, 0, world);
+    }
+  }
+
 }
 
 /* End of FixIMD class implementation. */
@@ -1401,11 +2051,32 @@ static int32 imd_writen(void *s, const char *ptr, int32 n) {
   return n;
 }
 
-int imd_handshake(void *s) {
+int imd_handshake_v2(void *s) {
   IMDheader header;
   imd_fill_header(&header, IMD_HANDSHAKE, 1);
-  header.length = IMDVERSION;   /* Not byteswapped! */
+  header.length = 2;   /* Not byteswapped! */
   return (imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE);
+}
+
+int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
+  IMDheader header;
+  imd_fill_header(&header, IMD_HANDSHAKE, 1);
+  header.length = 3;   /* Not byteswapped so client can determine native endinaness */
+
+  int32 body = 0;
+  body |= imdsinfo->time << 0;
+  body |= imdsinfo->energies << 1;
+  body |= imdsinfo->box << 2;
+  body |= imdsinfo->coords << 3;
+  body |= imdsinfo->velocities << 4;
+  body |= imdsinfo->forces << 5;
+  body |= imdsinfo->wrap << 6;
+  body = imd_htonl(body);
+
+  bool header_error = imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE;
+  bool body_error = imd_writen(s, (char *)&body, 4) != 4;
+
+  return (header_error || body_error);
 }
 
 /* The IMD receive functions */

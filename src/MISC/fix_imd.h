@@ -56,6 +56,9 @@ FixStyle(imd,FixIMD);
 #include <pthread.h>
 #endif
 
+/* IMDv3 session information */
+struct IMDSessionInfo;
+
 /* prototype for c wrapper that calls the real worker */
 extern "C" void *fix_imd_ioworker(void *);
 
@@ -80,13 +83,17 @@ class FixIMD : public Fix {
   int num_coords;       // total number of atoms controlled by this fix
   int size_one;         // bytes per atom in communication buffer.
   int maxbuf;           // size of atom communication buffer.
-  void *comm_buf;       // communication buffer
+  void *coord_data;     // communication buffer for coordinates
+  void *vel_data;       // communication buffer for velocities
+  void *force_data;     // communication buffer for forces
   void *idmap;          // hash for mapping atom indices to consistent order.
   tagint *rev_idmap;    // list of the hash keys for reverse mapping.
 
-  int imd_forces;       // number of forces communicated via IMD.
-  void *force_buf;      // force data buffer
-  double imd_fscale;    // scale factor for forces. in case VMD's units are off.
+  int imd_version;    // version of the IMD protocol to be used.
+
+  int imd_forces;          // number of forces communicated via IMD.
+  void *recv_force_buf;    // force data buffer
+  double imd_fscale;       // scale factor for forces. in case VMD's units are off.
 
   int imd_inactive;     // true if IMD connection stopped.
   int imd_terminate;    // true if IMD requests termination of run.
@@ -96,11 +103,18 @@ class FixIMD : public Fix {
   int nowait_flag;    // true if LAMMPS should not wait with the execution for VMD.
   int connect_msg;    // flag to indicate whether a "listen for connection message" is needed.
 
+  /* IMDv3-only */
+  IMDSessionInfo *imdsinfo;    // session information for IMDv3
+
   int me;               // my MPI rank in this "world".
   int nlevels_respa;    // flag to determine respa levels.
 
   int msglen;
   char *msgdata;
+
+ private:
+  void handle_step_v2();
+  void handle_step_v3();
 
 #if defined(LAMMPS_ASYNC_IMD)
   int buf_has_data;               // flag to indicate to the i/o thread what to do.
