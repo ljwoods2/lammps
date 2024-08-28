@@ -58,6 +58,7 @@ Pre-processing tools
    * :ref:`polybond <polybond>`
    * :ref:`stl_bin2txt <stlconvert>`
    * :ref:`tabulate <tabulate>`
+   * :ref:`tinker <tinker>`
 
 Post-processing tools
 =====================
@@ -95,8 +96,10 @@ Miscellaneous tools
    * :ref:`LAMMPS-GUI <lammps_gui>`
    * :ref:`LAMMPS magic patterns for file(1) <magic>`
    * :ref:`Offline build tool <offline>`
+   * :ref:`Regression tester <regression>`
    * :ref:`singularity/apptainer <singularity_tool>`
    * :ref:`SWIG interface <swig>`
+   * :ref:`valgrind <valgrind>`
    * :ref:`vim <vim>`
 
 ----------
@@ -109,7 +112,7 @@ Tool descriptions
 amber2lmp tool
 --------------------------
 
-The amber2lmp subdirectory contains two Python scripts for converting
+The amber2lmp subdirectory contains three Python scripts for converting
 files back-and-forth between the AMBER MD code and LAMMPS.  See the
 README file in amber2lmp for more information.
 
@@ -302,7 +305,7 @@ The parameters for Cr were taken from:
 Lin Z B, Johnson R A and Zhigilei L V, Phys. Rev. B 77 214108 (2008).
 
 The Python version of the tool was authored  by Germain Clavier
-(TU Eindhoven) g.m.g.c.clavier at tue.nl or germain.clavier at gmail.com
+(Unicaen) germain.clavier at unicaen.fr
 
 .. note::
 
@@ -989,6 +992,30 @@ README for more info on Pizza.py and how to use these scripts.
 
 ----------
 
+.. _regression:
+
+Regression tester tool
+----------------------
+
+The regression-tests subdirectory contains a tool for performing
+regression tests with a given LAMMPS binary.  The tool launches the
+LAMMPS binary with any given input script under one of the `examples`
+subdirectories, and compares the thermo output in the generated log file
+with those in the provided log file with the same number of processors
+ub the same subdirectory. If the differences between the actual and
+reference values are within specified tolerances, the test is considered
+passed.  For each test batch, that is, a set of example input scripts,
+the mpirun command, the LAMMPS command line arguments, and the
+tolerances for individual thermo quantities can be specified in a
+configuration file in YAML format.
+
+The tool also reports if and how the run fails, and if a reference log file
+is missing.  See the README file for more information.
+
+This tool was written by Trung Nguyen at U of Chicago (ndactrung at gmail.com).
+
+----------
+
 .. _replica:
 
 replica tool
@@ -1207,6 +1234,33 @@ The ``tabulate`` folder contains Python scripts scripts to generate tabulated
 potential files for LAMMPS.  The bulk of the code is in the ``tabulate`` module
 in the ``tabulate.py`` file.  Some example files demonstrating its use are
 included.  See the README file for more information.
+
+----------
+
+.. _tinker:
+
+tinker tool
+--------------
+
+The ``tinker`` folder contains Python scripts scripts to convert Tinker input
+files to LAMMPS.
+
+See the README file for more information.
+
+Those scripts were written by Steve Plimpton sjplimp at gmail.com
+
+----------
+
+.. _valgrind:
+
+valgrind tool
+-------------
+
+The ``valgrind`` folder contains additional suppressions fur LAMMPS when using
+valgrind's memcheck tool to search for memory access violation and memory
+leaks. These suppressions are automatically invoked when running tests through
+CMake "ctest -T memcheck". See the provided README file to add these
+suppressions when running LAMMPS.
 
 ----------
 
