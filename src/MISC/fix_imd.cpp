@@ -2071,7 +2071,6 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   body |= imdsinfo->velocities << 4;
   body |= imdsinfo->forces << 5;
   body |= imdsinfo->wrap << 6;
-  body = imd_htonl(body);
 
   bool header_error = imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE;
   bool body_error = imd_writen(s, (char *)&body, 4) != 4;
