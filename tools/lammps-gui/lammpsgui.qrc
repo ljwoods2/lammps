@@ -13,6 +13,7 @@
     <file>icons/application-plot.png</file>
     <file>icons/application-yaml.png</file>
     <file>icons/axes-img.png</file>
+    <file>icons/chart-smooth.png</file>
     <file>icons/document-new.png</file>
     <file>icons/document-open-recent.png</file>
     <file>icons/document-open.png</file>
@@ -57,6 +58,7 @@
     <file>icons/preferences-desktop.png</file>
     <file>icons/process-stop.png</file>
     <file>icons/run-file.png</file>
+    <file>icons/search.png</file>
     <file>icons/system-box.png</file>
     <file>icons/system-help.png</file>
     <file>icons/system-run.png</file>

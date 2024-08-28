@@ -15,6 +15,7 @@
 
 #include "chartviewer.h"
 #include "fileviewer.h"
+#include "findandreplace.h"
 #include "helpers.h"
 #include "highlighter.h"
 #include "imageviewer.h"
@@ -40,7 +41,6 @@
 #include <QGuiApplication>
 #include <QLabel>
 #include <QLineEdit>
-#include <QLocale>
 #include <QMessageBox>
 #include <QProcess>
 #include <QProgressBar>
@@ -76,9 +76,6 @@ LammpsGui::LammpsGui(QWidget *parent, const char *filename) :
     prefdialog(nullptr), lammpsstatus(nullptr), varwindow(nullptr), wizard(nullptr),
     runner(nullptr), is_running(false), run_counter(0)
 {
-    // enforce using the plain ASCII C locale within the GUI.
-    QLocale::setDefault(QLocale("C"));
-
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     // register QList<QString> only needed for Qt5
     qRegisterMetaTypeStreamOperators<QList<QString>>("QList<QString>");
@@ -94,14 +91,7 @@ LammpsGui::LammpsGui(QWidget *parent, const char *filename) :
     // use $HOME if we get dropped to "/" like on macOS
     if (current_dir == "/") current_dir = QDir::homePath();
     inspectList.clear();
-
-#define stringify(x) myxstr(x)
-#define myxstr(x) #x
-    QCoreApplication::setOrganizationName("The LAMMPS Developers");
-    QCoreApplication::setOrganizationDomain("lammps.org");
-    QCoreApplication::setApplicationName("LAMMPS-GUI - QT" stringify(QT_VERSION_MAJOR));
-#undef stringify
-#undef myxstr
+    setAutoFillBackground(true);
 
     // restore and initialize settings
     QSettings settings;
@@ -217,6 +207,7 @@ LammpsGui::LammpsGui(QWidget *parent, const char *filename) :
     connect(ui->actionPaste, &QAction::triggered, this, &LammpsGui::paste);
     connect(ui->actionUndo, &QAction::triggered, this, &LammpsGui::undo);
     connect(ui->actionRedo, &QAction::triggered, this, &LammpsGui::redo);
+    connect(ui->actionSearchAndReplace, &QAction::triggered, this, &LammpsGui::findandreplace);
     connect(ui->actionRun_Buffer, &QAction::triggered, this, &LammpsGui::run_buffer);
     connect(ui->actionRun_File, &QAction::triggered, this, &LammpsGui::run_file);
     connect(ui->actionStop_LAMMPS, &QAction::triggered, this, &LammpsGui::stop_run);
@@ -823,8 +814,7 @@ void LammpsGui::inspect_file(const QString &fileName)
             dataviewer->show();
             ilist->data = dataviewer;
             QFile(infodata).remove();
-            auto *inspect_image = new ImageViewer(
-                fileName, &lammps, QString("LAMMPS-GUI: Image for %1").arg(shortName));
+            auto *inspect_image = new ImageViewer(fileName, &lammps);
             inspect_image->setFont(font());
             inspect_image->show();
             ilist->image = inspect_image;
@@ -1441,7 +1431,11 @@ void LammpsGui::setFont(const QFont &newfont)
 void LammpsGui::about()
 {
     std::string version = "This is LAMMPS-GUI version " LAMMPS_GUI_VERSION;
-    version += " using Qt version " QT_VERSION_STR "\n";
+    version += " using Qt version " QT_VERSION_STR;
+    if (is_light_theme())
+        version += " using light theme\n";
+    else
+        version += " using dark theme\n";
     if (lammps.has_plugin()) {
         version += "LAMMPS library loaded as plugin";
         if (!plugin_path.empty()) {
@@ -1470,8 +1464,10 @@ void LammpsGui::about()
     }
 
     to_clipboard += info.c_str();
+#if QT_CONFIG(clipboard)
     QGuiApplication::clipboard()->setText(to_clipboard);
     info += "(Note: this text has been copied to the clipboard)\n";
+#endif
 
     QMessageBox msg;
     msg.setWindowTitle("About LAMMPS-GUI");
@@ -1871,6 +1867,14 @@ void LammpsGui::edit_variables()
         lammps.close();
         lammpsstatus->hide();
     }
+}
+
+void LammpsGui::findandreplace()
+{
+    FindAndReplace find(ui->textEdit, this);
+    find.setFont(font());
+    find.setObjectName("find");
+    find.exec();
 }
 
 void LammpsGui::preferences()
