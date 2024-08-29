@@ -372,6 +372,7 @@ typedef enum IMDType_t {
   IMD_TRATE,        /**< set IMD update transmission rate          */
   IMD_IOERROR,       /**< indicate an I/O error                     */
   /* IMDv3 only headers */
+  IMD_SESSIONINFO,
   IMD_RESUME,
   IMD_TIME,
   IMD_BOX,
@@ -709,6 +710,7 @@ int FixIMD::reconnect()
       } else {
         fprintf(screen,"Waiting for IMD connection on port %d. Transfer rate %d.\n",imd_port, imd_trate);
       }
+      fflush(screen);
     }
     connect_msg = 0;
     clientsock = nullptr;
@@ -938,7 +940,9 @@ void FixIMD::ioworker()
  * Send coodinates, energies, and add IMD forces to atoms. */
 void FixIMD::post_force(int /*vflag*/)
 {
-
+  // NOTE: removeme
+  fprintf(screen, "post_force() %ld\n", update->ntimestep);
+  fflush(screen);
   if (imd_version == 2) {
     handle_step_v2();
   }
@@ -1511,7 +1515,7 @@ void FixIMD::handle_step_v3() {
 
     int offset = 0;
     if (imdsinfo->time) {
-      imd_fill_header((IMDheader *)msgdata, IMD_TIME, 0);
+      imd_fill_header((IMDheader *)msgdata, IMD_TIME, 1);
       ((float *)(msgdata+IMDHEADERSIZE))[0] = update->dt;
       float currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
       ((float *)(msgdata+IMDHEADERSIZE))[1] = currtime;
@@ -1519,7 +1523,7 @@ void FixIMD::handle_step_v3() {
       fprintf(screen, "time header filled with %f %f\n", update->dt, currtime);
     }
     if (imdsinfo->box) {
-      imd_fill_header((IMDheader *)(msgdata + offset), IMD_BOX, 0);
+      imd_fill_header((IMDheader *)(msgdata + offset), IMD_BOX, 1);
       // Get triclinic box vectors
       float *box = (float *)(msgdata+offset+IMDHEADERSIZE);
       box[0] = domain->h[0];
@@ -1533,7 +1537,7 @@ void FixIMD::handle_step_v3() {
       box[8] = domain->h[2];
       
       fprintf(screen, "box header filled with %f\n", domain->h[0]);
-      offset += 9*4+IMDHEADERSIZE;
+      offset += (9*4)+IMDHEADERSIZE;
       
     }
     if (imdsinfo->coords) {
@@ -2063,19 +2067,21 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   imd_fill_header(&header, IMD_HANDSHAKE, 1);
   header.length = 3;   /* Not byteswapped so client can determine native endinaness */
 
-  int32 body = 0;
-  body |= imdsinfo->time << 0;
-  body |= imdsinfo->energies << 1;
-  body |= imdsinfo->box << 2;
-  body |= imdsinfo->coords << 3;
-  body |= imdsinfo->velocities << 4;
-  body |= imdsinfo->forces << 5;
-  body |= imdsinfo->wrap << 6;
+  if (imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE) return -1;
 
-  bool header_error = imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE;
-  bool body_error = imd_writen(s, (char *)&body, 4) != 4;
+  imd_fill_header(&header, IMD_SESSIONINFO, 7);
+  unsigned char body[7] = {0};
+  body[0] = imdsinfo->time;
+  body[1] = imdsinfo->energies;
+  body[2] = imdsinfo->box;
+  body[3] = imdsinfo->coords;
+  body[4] = imdsinfo->velocities;
+  body[5] = imdsinfo->forces;
+  body[6] = imdsinfo->wrap;
 
-  return (header_error || body_error);
+  if (imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE || 
+      imd_writen(s, (char *)&body, 7) != 7) return -1;
+  return 0;
 }
 
 /* The IMD receive functions */

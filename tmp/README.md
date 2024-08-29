@@ -1,7 +1,7 @@
 Configure build
 ```
 cd build
-cmake ../cmake/ -D PKG_MISC=yes
+cmake ../cmake/ -D PKG_MISC=yes -D PKG_EXTRA-DUMP=yes
 ```
 
 
@@ -29,7 +29,7 @@ cd ../tmp/out
 
 Run with v3 test
 ```
-../../build/lmp < ../example_v3.in
+lmp < ../example_v3.in
 ```
 
 Per MPI rank memory allocation (min/avg/max) = 6.915 | 6.915 | 6.915 Mbytes
