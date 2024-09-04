@@ -565,7 +565,7 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   
   msglen = 0;
   if (imdsinfo->time) {
-    msglen += 4+IMDHEADERSIZE;
+    msglen += 24+IMDHEADERSIZE;
   }
   if (imdsinfo->box) {
     msglen += 9*4+IMDHEADERSIZE;
@@ -1516,10 +1516,18 @@ void FixIMD::handle_step_v3() {
     int offset = 0;
     if (imdsinfo->time) {
       imd_fill_header((IMDheader *)msgdata, IMD_TIME, 1);
-      ((float *)(msgdata+IMDHEADERSIZE))[0] = update->dt;
-      float currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
-      ((float *)(msgdata+IMDHEADERSIZE))[1] = currtime;
-      offset += 8+IMDHEADERSIZE;
+
+      double dt = update->dt;
+      fprintf(screen, "size of dt: %ld\n", sizeof(dt));
+    
+      double currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
+      unsigned long long currstep = update->ntimestep;
+      char *time = (msgdata+IMDHEADERSIZE);
+
+      memcpy(time, &dt, sizeof(dt));
+      memcpy(time+sizeof(dt), &currtime, sizeof(currtime));
+      memcpy(time+sizeof(dt)+sizeof(currtime), &currstep, sizeof(currstep));
+      offset += IMDHEADERSIZE+sizeof(dt)+sizeof(currtime)+sizeof(currstep);
       fprintf(screen, "time header filled with %f %f\n", update->dt, currtime);
     }
     if (imdsinfo->box) {

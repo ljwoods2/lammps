@@ -1,7 +1,12 @@
+Download H5MD
+```
+sudo apt-get install libhdf5-dev
+```
+
 Configure build
 ```
 cd build
-cmake ../cmake/ -D PKG_MISC=yes -D PKG_EXTRA-DUMP=yes
+cmake ../cmake/ -D PKG_MISC=yes -D PKG_H5MD=yes
 ```
 
 
