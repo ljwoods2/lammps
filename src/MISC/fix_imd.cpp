@@ -396,12 +396,12 @@ typedef struct {
 /* IMDv3 only */
 typedef struct IMDSessionInfo {
   bool time;
-  bool energies;
   bool box;
   bool coords;
+  bool wrap;
   bool velocities;
   bool forces;
-  bool wrap;
+  bool energies;
 } IMDSessionInfo;
 
 /** Send control messages - these consist of a header with no subsequent data */
@@ -522,22 +522,22 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   /* In IMDv2 in LAMMPS, only coordinates are sent*/
   if (imd_version == 2) {
     imdsinfo->time = false;
-    imdsinfo->energies = false;
     imdsinfo->box = false;
     imdsinfo->coords = true;
+    imdsinfo->wrap = !unwrap_flag;
     imdsinfo->velocities = false;
     imdsinfo->forces = false; 
-    imdsinfo->wrap = !unwrap_flag;
+    imdsinfo->energies = false;
   }
 
   if (imd_version == 3) {
     imdsinfo->time = time_flag;
-    imdsinfo->energies = false;
     imdsinfo->box = box_flag;
     imdsinfo->coords = coord_flag;
+    imdsinfo->wrap = !unwrap_flag;
     imdsinfo->velocities = vel_flag;
     imdsinfo->forces = force_flag;
-    imdsinfo->wrap = !unwrap_flag;
+    imdsinfo->energies = false;
   }
 
 
@@ -650,15 +650,10 @@ fprintf(screen, "destructor called\n");
 #endif
 
   auto hashtable = (taginthash_t *)idmap;
-  if (imdsinfo->coords) {
-    memory->destroy(coord_data);
-  }
-  if (imdsinfo->velocities) {
-    memory->destroy(vel_data);
-  }
-  if (imdsinfo->forces) {
-    memory->destroy(force_data);
-  }
+  memory->destroy(coord_data);
+  memory->destroy(vel_data);
+  memory->destroy(force_data);
+
   memory->destroy(msgdata);
   memory->destroy(recv_force_buf);
   taginthash_destroy(hashtable);
@@ -681,6 +676,7 @@ int FixIMD::setmask()
   int mask = 0;
   mask |= POST_FORCE;
   mask |= POST_FORCE_RESPA;
+  mask |= END_OF_STEP;
   return mask;
 }
 
@@ -947,7 +943,7 @@ void FixIMD::post_force(int /*vflag*/)
     handle_step_v2();
   }
   else if (imd_version == 3) {
-    handle_step_v3();
+    handle_client_input_v3();
   }
 
   }
@@ -957,6 +953,14 @@ void FixIMD::post_force_respa(int vflag, int ilevel, int /*iloop*/)
 {
   /* only process IMD on the outmost RESPA level. */
   if (ilevel == nlevels_respa-1) post_force(vflag);
+}
+
+void FixIMD::end_of_step()
+{ 
+  fprintf(screen, "end_of_step() call.\n");
+  if (imd_version == 3 && update->ntimestep % imd_trate == 0) {
+    handle_output_v3();
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1299,10 +1303,10 @@ void FixIMD::handle_step_v2() {
 
 }
 
-void FixIMD::handle_step_v3() {
+void FixIMD::handle_client_input_v3() {
   // IMDV3
+  fprintf(screen, "handle_client_input_v3() call.\n");
 
-  fprintf(screen, "handle_step_v3() call.\n");
   /* check for reconnect */
   if (imd_inactive) {
     reconnect();
@@ -1314,14 +1318,11 @@ void FixIMD::handle_step_v3() {
       return;     /* IMD client has detached and not yet come back. do nothing. */
   }
 
-  tagint *tag = atom->tag;
-  double **x = atom->x;
-  double **v = atom->v;
-  double **f = atom->f;
-  imageint *image = atom->image;
+  struct commdata *buf;
   int nlocal = atom->nlocal;
   int *mask  = atom->mask;
-  struct commdata *buf;
+  tagint *tag = atom->tag;
+  double **f = atom->f;
 
   if (me == 0) {
     /* process all pending incoming data. */
@@ -1458,28 +1459,37 @@ void FixIMD::handle_step_v3() {
    *
    * If we don't communicate, only check if we have forces
    * stored away and apply them. */
-  if (update->ntimestep % imd_trate) {
-    if (imd_forces > 0) {
-      buf = static_cast<struct commdata *>(recv_force_buf);
+  if (imd_forces > 0) {
+    buf = static_cast<struct commdata *>(recv_force_buf);
 
-      /* XXX. this is in principle O(N**2) == not good.
-       * however we assume for now that the number of atoms
-       * that we manipulate via IMD will be small compared
-       * to the total system size, so we don't hurt too much. */
-      for (int j=0; j < imd_forces; ++j) {
-        for (int i=0; i < nlocal; ++i) {
-          if (mask[i] & groupbit) {
-            if (buf[j].tag == tag[i]) {
-              f[i][0] += imd_fscale*buf[j].x;
-              f[i][1] += imd_fscale*buf[j].y;
-              f[i][2] += imd_fscale*buf[j].z;
-            }
+    /* XXX. this is in principle O(N**2) == not good.
+      * however we assume for now that the number of atoms
+      * that we manipulate via IMD will be small compared
+      * to the total system size, so we don't hurt too much. */
+    for (int j=0; j < imd_forces; ++j) {
+      for (int i=0; i < nlocal; ++i) {
+        if (mask[i] & groupbit) {
+          if (buf[j].tag == tag[i]) {
+            f[i][0] += imd_fscale*buf[j].x;
+            f[i][1] += imd_fscale*buf[j].y;
+            f[i][2] += imd_fscale*buf[j].z;
           }
         }
       }
     }
-    return;
   }
+}
+
+void FixIMD::handle_output_v3() {
+
+  tagint *tag = atom->tag;
+  double **x = atom->x;
+  double **v = atom->v;
+  double **f = atom->f;
+  imageint *image = atom->image;
+  int nlocal = atom->nlocal;
+  int *mask  = atom->mask;
+  struct commdata *buf;
 
   /* check and potentially grow local communication buffers. */
   int i, k, nmax, nme=0;
@@ -1622,7 +1632,7 @@ void FixIMD::handle_step_v3() {
             recvvel[j+2] = v[i][2];
           }
         }
-      }
+          }
     }
     if (imdsinfo->forces) {
       for (i=0; i<nlocal; ++i) {
@@ -2080,12 +2090,12 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   imd_fill_header(&header, IMD_SESSIONINFO, 7);
   unsigned char body[7] = {0};
   body[0] = imdsinfo->time;
-  body[1] = imdsinfo->energies;
-  body[2] = imdsinfo->box;
-  body[3] = imdsinfo->coords;
+  body[1] = imdsinfo->box;
+  body[2] = imdsinfo->coords;
+  body[3] = imdsinfo->wrap;
   body[4] = imdsinfo->velocities;
   body[5] = imdsinfo->forces;
-  body[6] = imdsinfo->wrap;
+  body[6] = imdsinfo->energies;
 
   if (imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE || 
       imd_writen(s, (char *)&body, 7) != 7) return -1;

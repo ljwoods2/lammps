@@ -72,8 +72,11 @@ class FixIMD : public Fix {
   void init() override;
   void setup(int) override;
   void post_force(int) override;
+  void end_of_step() override;
   void post_force_respa(int, int, int) override;
   double memory_usage() override;
+  // Fix nevery at 1, use trate to skip in 'end_of_step`
+  int nevery = 1;
 
  protected:
   int imd_port;
@@ -114,7 +117,8 @@ class FixIMD : public Fix {
 
  private:
   void handle_step_v2();
-  void handle_step_v3();
+  void handle_client_input_v3();
+  void handle_output_v3();
 
 #if defined(LAMMPS_ASYNC_IMD)
   int buf_has_data;               // flag to indicate to the i/o thread what to do.
