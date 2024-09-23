@@ -2090,13 +2090,13 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   imd_fill_header(&header, IMD_SESSIONINFO, 7);
   unsigned char body[7] = {0};
   body[0] = imdsinfo->time;
-  body[1] = imdsinfo->box;
-  body[2] = imdsinfo->coords;
-  body[3] = imdsinfo->wrap;
-  body[4] = imdsinfo->velocities;
-  body[5] = imdsinfo->forces;
-  body[6] = imdsinfo->energies;
-
+  body[1] = imdsinfo->energies;
+  body[2] = imdsinfo->box;
+  body[3] = imdsinfo->coords;
+  body[4] = imdsinfo->wrap;
+  body[5] = imdsinfo->velocities;
+  body[6] = imdsinfo->forces;
+  
   if (imd_writen(s, (char *)&header, IMDHEADERSIZE) != IMDHEADERSIZE || 
       imd_writen(s, (char *)&body, 7) != 7) return -1;
   return 0;
