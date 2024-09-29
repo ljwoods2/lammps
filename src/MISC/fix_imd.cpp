@@ -398,7 +398,7 @@ typedef struct IMDSessionInfo {
   bool time;
   bool box;
   bool coords;
-  bool wrap;
+  bool unwrap;
   bool velocities;
   bool forces;
   bool energies;
@@ -524,7 +524,7 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
     imdsinfo->time = false;
     imdsinfo->box = false;
     imdsinfo->coords = true;
-    imdsinfo->wrap = !unwrap_flag;
+    imdsinfo->unwrap = unwrap_flag;
     imdsinfo->velocities = false;
     imdsinfo->forces = false; 
     imdsinfo->energies = false;
@@ -534,7 +534,7 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
     imdsinfo->time = time_flag;
     imdsinfo->box = box_flag;
     imdsinfo->coords = coord_flag;
-    imdsinfo->wrap = !unwrap_flag;
+    imdsinfo->unwrap = unwrap_flag;
     imdsinfo->velocities = vel_flag;
     imdsinfo->forces = force_flag;
     imdsinfo->energies = false;
@@ -1175,7 +1175,7 @@ void FixIMD::handle_step_v2() {
     fprintf(screen, "buf recast\n");
 
     /* add local data */
-    if (!imdsinfo->wrap) {
+    if (imdsinfo->unwrap) {
       fprintf(screen, "adding local data\n");
       double xprd = domain->xprd;
       double yprd = domain->yprd;
@@ -1256,7 +1256,7 @@ void FixIMD::handle_step_v2() {
   } else {
     /* copy coordinate data into communication buffer */
     nme = 0;
-    if (unwrap_flag) {
+    if (imdsinfo->unwrap) {
       double xprd = domain->xprd;
       double yprd = domain->yprd;
       double zprd = domain->zprd;
@@ -1578,7 +1578,7 @@ void FixIMD::handle_output_v3() {
 
     /* add local data */
     if (imdsinfo->coords) {
-      if (!imdsinfo->wrap) {
+      if (imdsinfo->unwrap) {
         double xprd = domain->xprd;
         double yprd = domain->yprd;
         double zprd = domain->zprd;
@@ -1740,7 +1740,7 @@ void FixIMD::handle_output_v3() {
     nme = 0;
     if (imdsinfo->coords) {
       buf = static_cast<struct commdata *>(coord_data);
-      if (unwrap_flag) {
+      if (imdsinfo->unwrap) {
         double xprd = domain->xprd;
         double yprd = domain->yprd;
         double zprd = domain->zprd;
@@ -2093,7 +2093,7 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   body[1] = imdsinfo->energies;
   body[2] = imdsinfo->box;
   body[3] = imdsinfo->coords;
-  body[4] = imdsinfo->wrap;
+  body[4] = imdsinfo->unwrap;
   body[5] = imdsinfo->velocities;
   body[6] = imdsinfo->forces;
   
