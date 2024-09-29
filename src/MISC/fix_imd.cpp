@@ -2093,7 +2093,7 @@ int imd_handshake_v3(void *s, IMDSessionInfo *imdsinfo) {
   body[1] = imdsinfo->energies;
   body[2] = imdsinfo->box;
   body[3] = imdsinfo->coords;
-  body[4] = imdsinfo->unwrap;
+  body[4] = !imdsinfo->unwrap;
   body[5] = imdsinfo->velocities;
   body[6] = imdsinfo->forces;
   
