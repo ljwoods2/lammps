@@ -1531,7 +1531,7 @@ void FixIMD::handle_output_v3() {
       fprintf(screen, "size of dt: %ld\n", sizeof(dt));
     
       double currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
-      unsigned long long currstep = update->ntimestep;
+      long long currstep = update->ntimestep;
       char *time = (msgdata+IMDHEADERSIZE);
 
       memcpy(time, &dt, sizeof(dt));
