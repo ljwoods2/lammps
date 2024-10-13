@@ -451,6 +451,8 @@ struct commdata {
   float x,y,z;
 };
 
+MPI_Datatype MPI_CommData;
+
 /***************************************************************
  * create class and parse arguments in LAMMPS script. Syntax:
  * fix ID group-ID imd <imd_trate> <imd_port> [version (2|3)] [unwrap (on|off)] [fscale <imd_fscale>] [time (on|off)] [box (on|off)] [coordinates (on|off)] [velocities (on|off)] [forces (on|off)]
@@ -545,8 +547,12 @@ FixIMD::FixIMD(LAMMPS *lmp, int narg, char **arg) :
   if (n > MAXSMALLINT) error->all(FLERR,"Too many atoms for fix imd");
   num_coords = static_cast<int> (n);
 
-  MPI_Comm_rank(world,&me);
+  // Define MPI dtype for passing x/v/f data
+  MPI_Type_contiguous(4, MPI_FLOAT, &MPI_CommData);
+  MPI_Type_commit(&MPI_CommData);
 
+  MPI_Comm_rank(world,&me);
+ 
   /* initialize various imd state variables. */
   clientsock = nullptr;
   localsock  = nullptr;
@@ -648,7 +654,7 @@ fprintf(screen, "destructor called\n");
     pthread_cond_destroy(&write_cond);
   }
 #endif
-
+  fprintf(screen, "destructor startinng\n");
   auto hashtable = (taginthash_t *)idmap;
   memory->destroy(coord_data);
   memory->destroy(vel_data);
@@ -1438,8 +1444,6 @@ void FixIMD::handle_client_input_v3() {
   if (imd_terminate)
     error->all(FLERR,"LAMMPS terminated on IMD request.");
 
-  fprintf(screen, "tasks updated.\n");
-
   if (imd_forces > 0) {
     /* check if we need to readjust the forces comm buffer on the receiving nodes. */
     if (me != 0) {
@@ -1491,44 +1495,18 @@ void FixIMD::handle_output_v3() {
   int *mask  = atom->mask;
   struct commdata *buf;
 
-  /* check and potentially grow local communication buffers. */
-  int i, k, nmax, nme=0;
-  for (i=0; i < nlocal; ++i)
-    if (mask[i] & groupbit) ++nme;
-  
-  MPI_Allreduce(&nme,&nmax,1,MPI_INT,MPI_MAX,world);
-  if (nmax*size_one > maxbuf) {
-    maxbuf = nmax*size_one;
-    if (imdsinfo->coords) {
-      memory->destroy(coord_data);
-      coord_data = memory->smalloc(maxbuf,"imd:coord_data");
-    }
-    if (imdsinfo->velocities) {
-      memory->destroy(vel_data);
-      vel_data = memory->smalloc(maxbuf,"imd:vel_data");
-    }
-    if (imdsinfo->forces) {
-      memory->destroy(force_data);
-      force_data = memory->smalloc(maxbuf,"imd:force_data");
-    }
-  }
+  // Only main process should use:
+  float *global_coords = nullptr;
+  float *global_vel = nullptr;
+  float *global_force = nullptr;
 
-  int tmp, ndata;
-
+  // Prepare offsets in outgoing buffer
+  // Fill what we can wihtout collecting from other processes
   if (me == 0) {
-    MPI_Status status;
-    MPI_Request request;
-
-    float * recvcoord = nullptr;
-    float * recvvel = nullptr;
-    float * recvforce = nullptr;
-
     int offset = 0;
     if (imdsinfo->time) {
       imd_fill_header((IMDheader *)msgdata, IMD_TIME, 1);
-
       double dt = update->dt;
-      fprintf(screen, "size of dt: %ld\n", sizeof(dt));
     
       double currtime = update->atime + ((update->ntimestep - update->atimestep) * update->dt);
       long long currstep = update->ntimestep;
@@ -1538,7 +1516,6 @@ void FixIMD::handle_output_v3() {
       memcpy(time+sizeof(dt), &currtime, sizeof(currtime));
       memcpy(time+sizeof(dt)+sizeof(currtime), &currstep, sizeof(currstep));
       offset += IMDHEADERSIZE+sizeof(dt)+sizeof(currtime)+sizeof(currstep);
-      fprintf(screen, "time header filled with %f %f\n", update->dt, currtime);
     }
     if (imdsinfo->box) {
       imd_fill_header((IMDheader *)(msgdata + offset), IMD_BOX, 1);
@@ -1554,173 +1531,190 @@ void FixIMD::handle_output_v3() {
       box[7] = domain->h[3];
       box[8] = domain->h[2];
       
-      fprintf(screen, "box header filled with %f\n", domain->h[0]);
       offset += (9*4)+IMDHEADERSIZE;
       
     }
     if (imdsinfo->coords) {
       imd_fill_header((IMDheader *)(msgdata + offset), IMD_FCOORDS, num_coords);
-      recvcoord = (float *) (msgdata + offset + IMDHEADERSIZE);
+      global_coords = (float *) (msgdata + offset + IMDHEADERSIZE);
       offset += 3*4*num_coords+IMDHEADERSIZE;
     }
     if (imdsinfo->velocities) {
       imd_fill_header((IMDheader *)(msgdata + offset), IMD_VELOCITIES, num_coords);
-      recvvel = (float *) (msgdata + offset + IMDHEADERSIZE);
+      global_vel = (float *) (msgdata + offset + IMDHEADERSIZE);
       offset += 3*4*num_coords+IMDHEADERSIZE;
     }
     if (imdsinfo->forces) {
       imd_fill_header((IMDheader *)(msgdata + offset), IMD_FORCES, num_coords);
-      recvforce = (float *) (msgdata + offset + IMDHEADERSIZE);
+      global_force = (float *) (msgdata + offset + IMDHEADERSIZE);
       offset += 3*4*num_coords+IMDHEADERSIZE;
     }
+  }
 
-    fprintf(screen, "finished calculating offsets.\n");
+  int ntotal, nmax, nme=0;
+  for (int i=0; i < nlocal; ++i)
+    if (mask[i] & groupbit) ++nme;
 
-    /* add local data */
-    if (imdsinfo->coords) {
-      if (imdsinfo->unwrap) {
-        double xprd = domain->xprd;
-        double yprd = domain->yprd;
-        double zprd = domain->zprd;
-        double xy = domain->xy;
-        double xz = domain->xz;
-        double yz = domain->yz;
+  // Atoms per proc
+  int *recvcounts = nullptr;
+  // Displacements in recv<coord/vel/force> for each proc
+  int *displs = nullptr;
 
-        for (i=0; i<nlocal; ++i) {
-          if (mask[i] & groupbit) {
-            const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
-            if (j != 3*HASH_FAIL) {
 
-              if (imdsinfo->coords) {
-                int ix = (image[i] & IMGMASK) - IMGMAX;
-                int iy = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-                int iz = (image[i] >> IMG2BITS) - IMGMAX;
+  if (me == 0) {
+    recvcounts = new int[comm->nprocs];
+    displs = new int[comm->nprocs];
+  }
 
-                if (domain->triclinic) {
-                  recvcoord[j]   = x[i][0] + ix * xprd + iy * xy + iz * xz;
-                  recvcoord[j+1] = x[i][1] + iy * yprd + iz * yz;
-                  recvcoord[j+2] = x[i][2] + iz * zprd;
-                } else {
-                  recvcoord[j]   = x[i][0] + ix * xprd;
-                  recvcoord[j+1] = x[i][1] + iy * yprd;
-                  recvcoord[j+2] = x[i][2] + iz * zprd;
-                }
-              }
-            }
-          }
-        }
-      } else {
-        for (i=0; i<nlocal; ++i) {
-          if (mask[i] & groupbit) {
-            const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
-            if (j != 3*HASH_FAIL) {
-              recvcoord[j]   = x[i][0];
-              recvcoord[j+1] = x[i][1];
-              recvcoord[j+2] = x[i][2];
-            }
-          }
-        }
-      }
+  MPI_Gather(&nme, 1, MPI_INT, recvcounts, 1, MPI_INT, 0, world);
+  
+  if (me == 0) {
+    displs[0] = 0;
+    ntotal = recvcounts[0];
+    for (int i = 1; i < comm->nprocs; ++i) {
+      displs[i] = displs[i - 1] + recvcounts[i - 1]; 
+      ntotal += recvcounts[i];
     }
-    if (imdsinfo->velocities) {
-      for (i=0; i<nlocal; ++i) {
+  }
+
+  if (imdsinfo->coords) {
+    commdata *recvcoord = nullptr;
+    memory->destroy(coord_data);
+    coord_data = memory->smalloc(nme*size_one, "imd:coord_data");
+    buf = static_cast<struct commdata *>(coord_data);
+    int idx = 0;
+    if (imdsinfo->unwrap) {
+          double xprd = domain->xprd;
+          double yprd = domain->yprd;
+          double zprd = domain->zprd;
+          double xy = domain->xy;
+          double xz = domain->xz;
+          double yz = domain->yz;
+      for (int i = 0; i < nlocal; ++i) {
         if (mask[i] & groupbit) {
-          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
-          if (j != 3*HASH_FAIL) {
-            recvvel[j]   = v[i][0];
-            recvvel[j+1] = v[i][1];
-            recvvel[j+2] = v[i][2];
+          int ix = (image[i] & IMGMASK) - IMGMAX;
+          int iy = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
+          int iz = (image[i] >> IMG2BITS) - IMGMAX;
+
+          if (domain->triclinic) {
+            buf[idx].tag = tag[i];
+            buf[idx].x = x[i][0]; + ix * xprd + iy * xy + iz * xz;
+            buf[idx].y = x[i][1]; + iy * yprd + iz * yz;
+            buf[idx].z = x[i][2]; + iz * zprd;
           }
+          else {
+            buf[idx].tag = tag[i];
+            buf[idx].x = x[i][0]; + ix * xprd;
+            buf[idx].y = x[i][1]; + iy * yprd;
+            buf[idx].z = x[i][2]; + iz * zprd;
+          }
+          ++idx;
         }
-          }
+      }
     }
-    if (imdsinfo->forces) {
-      for (i=0; i<nlocal; ++i) {
+    else {
+      for (int i = 0; i < nlocal; ++i) {
         if (mask[i] & groupbit) {
-          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, tag[i]);
-          if (j != 3*HASH_FAIL) {
-            recvforce[j]   = f[i][0];
-            recvforce[j+1] = f[i][1];
-            recvforce[j+2] = f[i][2];
+          buf[idx].tag = tag[i];
+          buf[idx].x = x[i][0];
+          buf[idx].y = x[i][1];
+          buf[idx].z = x[i][2];
+          ++idx;
+        }
+      }
+    }
+    if (me == 0) {
+      recvcoord = new commdata[ntotal];
+    }
+    MPI_Gatherv(buf, nme, MPI_CommData,
+              recvcoord, recvcounts, displs, MPI_CommData, 0, world);
+    if (me == 0) {
+      // Sort the coordinates by tag, place in global_coords
+      for (int i = 0; i < comm->nprocs; ++i) {
+        for (int j = 0; j < recvcounts[i]; ++j) {
+          int idx = displs[i]+j;
+          const tagint t = 3*taginthash_lookup((taginthash_t *)idmap, recvcoord[idx].tag);
+          if (t != 3*HASH_FAIL) {
+            global_coords[t] = recvcoord[idx].x; 
+            global_coords[t + 1] = recvcoord[idx].y;
+            global_coords[t + 2] = recvcoord[idx].z;
           }
         }
       }
     }
-
-    /* loop over procs to receive remote coord data */
-    std::vector<MPI_Status> statuses;
-    std::vector<MPI_Request> requests;
-    for (i=1; i < comm->nprocs; ++i) {
-      statuses.clear();
-      requests.clear();
-      if (imdsinfo->coords) {
-        requests.push_back(MPI_Request());
-        MPI_Irecv(coord_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
+  }
+  if (imdsinfo->velocities) {
+    commdata *recvvel = nullptr;
+    memory->destroy(vel_data);
+    vel_data = memory->smalloc(nme*size_one, "imd:vel_data");
+    buf = static_cast<struct commdata *>(vel_data);
+    int idx = 0;
+    for (int i = 0; i < nlocal; ++i) {
+      if (mask[i] & groupbit) {
+        buf[idx].tag = tag[i];
+        buf[idx].x = v[i][0];
+        buf[idx].y = v[i][1];
+        buf[idx].z = v[i][2];
+        ++idx;
       }
-      if (imdsinfo->velocities) {
-        requests.push_back(MPI_Request());
-        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
-      }
-      if (imdsinfo->forces) {
-        requests.push_back(MPI_Request());
-        MPI_Irecv(vel_data, maxbuf, MPI_BYTE, i, 0, world, &requests.back());
-      }
-      statuses.resize(requests.size());
-      MPI_Send(&tmp, 0, MPI_INT, i, 0, world);
-      MPI_Waitall(requests.size(), requests.data(), statuses.data());
-
-      if (imdsinfo->coords) {
-        buf = static_cast<struct commdata *>(coord_data);
-        MPI_Status status = statuses.front();
-        statuses.erase(statuses.begin());
-        MPI_Get_count(&status, MPI_BYTE, &ndata);
-        buf = static_cast<struct commdata *>(coord_data);
-        ndata /= size_one;
-        for (k=0; k<ndata; ++k) {
-          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
-          if (j != 3*HASH_FAIL) {
-            recvcoord[j]   = buf[k].x;
-            recvcoord[j+1] = buf[k].y;
-            recvcoord[j+2] = buf[k].z;
+    }
+    if (me == 0) {
+      recvvel = new commdata[ntotal];
+    }
+    MPI_Gatherv(buf, nme, MPI_CommData,
+              recvvel, recvcounts, displs, MPI_CommData, 0, world);
+    if (me == 0) {
+      // Sort the coordinates by tag, place in global_vels
+      for (int i = 0; i < comm->nprocs; ++i) {
+        for (int j = 0; j < recvcounts[i]; ++j) {
+          int idx = displs[i]+j;
+          const tagint t = 3*taginthash_lookup((taginthash_t *)idmap, recvvel[idx].tag);
+          if (t != 3*HASH_FAIL) {
+            global_vel[t] = recvvel[idx].x;
+            global_vel[t + 1] = recvvel[idx].y;
+            global_vel[t + 2] = recvvel[idx].z;
           }
         }
       }
-      if (imdsinfo->velocities) {
-        buf = static_cast<struct commdata *>(vel_data);
-        MPI_Status status = statuses.front();
-        statuses.erase(statuses.begin());
-        MPI_Get_count(&status, MPI_BYTE, &ndata);
-        buf = static_cast<struct commdata *>(vel_data);
-        ndata /= size_one;
-        for (k=0; k<ndata; ++k) {
-          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
-          if (j != 3*HASH_FAIL) {
-            recvvel[j]   = buf[k].x;
-            recvvel[j+1] = buf[k].y;
-            recvvel[j+2] = buf[k].z;
+    }
+  }
+  if (imdsinfo->forces) {
+    commdata *recvforce = nullptr;
+    memory->destroy(force_data);
+    force_data = memory->smalloc(nme*size_one, "imd:force_data");
+    buf = static_cast<struct commdata *>(force_data);
+    int idx = 0;
+    for (int i = 0; i < nlocal; ++i) {
+      if (mask[i] & groupbit) {
+        buf[idx].tag = tag[i];
+        buf[idx].x = f[i][0];
+        buf[idx].y = f[i][1];
+        buf[idx].z = f[i][2];
+        ++idx;
+      }
+    }
+    if (me == 0) {
+      recvforce = new commdata[ntotal];
+    }
+    MPI_Gatherv(buf, nme, MPI_CommData,
+              recvforce, recvcounts, displs, MPI_CommData, 0, world);
+    if (me == 0) {
+      // Sort the coordinates by tag, place in global_coords
+      for (int i = 0; i < comm->nprocs; ++i) {
+        for (int j = 0; j < recvcounts[i]; ++j) {
+          int idx = displs[i]+j;
+          const tagint t = 3*taginthash_lookup((taginthash_t *)idmap, recvforce[idx].tag);
+          if (t != 3*HASH_FAIL) {
+            global_force[t] = recvforce[idx].x;
+            global_force[t + 1] = recvforce[idx].y;
+            global_force[t + 2] = recvforce[idx].z;
           }
         }
       }
-      if (imdsinfo->forces) {
-        buf = static_cast<struct commdata *>(force_data);
-        MPI_Status status = statuses.front();
-        statuses.erase(statuses.begin());
-        MPI_Get_count(&status, MPI_BYTE, &ndata);
-        buf = static_cast<struct commdata *>(force_data);
-        ndata /= size_one;
-        for (k=0; k<ndata; ++k) {
-          const tagint j = 3*taginthash_lookup((taginthash_t *)idmap, buf[k].tag);
-          if (j != 3*HASH_FAIL) {
-            recvforce[j]   = buf[k].x;
-            recvforce[j+1] = buf[k].y;
-            recvforce[j+2] = buf[k].z;
-          }
-        }
-      
-      }
-      }
+    }
+  }
 
-    /* done collecting frame data now communicate with IMD client. */
+/* done collecting frame data now communicate with IMD client. */
 
 #if defined(LAMMPS_ASYNC_IMD)
     /* wake up i/o worker thread and release lock on i/o buffer
@@ -1734,89 +1728,6 @@ void FixIMD::handle_output_v3() {
       imd_writen(clientsock, msgdata, msglen);
     }
 #endif
-
-  } else {
-    /* copy xvf data into communication buffer */
-    nme = 0;
-    if (imdsinfo->coords) {
-      buf = static_cast<struct commdata *>(coord_data);
-      if (imdsinfo->unwrap) {
-        double xprd = domain->xprd;
-        double yprd = domain->yprd;
-        double zprd = domain->zprd;
-        double xy = domain->xy;
-        double xz = domain->xz;
-        double yz = domain->yz;
-
-        for (i=0; i<nlocal; ++i) {
-          if (mask[i] & groupbit) {
-            int ix = (image[i] & IMGMASK) - IMGMAX;
-            int iy = (image[i] >> IMGBITS & IMGMASK) - IMGMAX;
-            int iz = (image[i] >> IMG2BITS) - IMGMAX;
-
-            if (domain->triclinic) {
-              buf[nme].tag = tag[i];
-              buf[nme].x   = x[i][0] + ix * xprd + iy * xy + iz * xz;
-              buf[nme].y   = x[i][1] + iy * yprd + iz * yz;
-              buf[nme].z   = x[i][2] + iz * zprd;
-            } else {
-              buf[nme].tag = tag[i];
-              buf[nme].x   = x[i][0] + ix * xprd;
-              buf[nme].y   = x[i][1] + iy * yprd;
-              buf[nme].z   = x[i][2] + iz * zprd;
-            }
-            ++nme;
-          }
-        }
-      } else {
-        for (i=0; i<nlocal; ++i) {
-          if (mask[i] & groupbit) {
-            buf[nme].tag = tag[i];
-            buf[nme].x   = x[i][0];
-            buf[nme].y   = x[i][1];
-            buf[nme].z   = x[i][2];
-            ++nme;
-          }
-        }
-      }
-    }
-    if (imdsinfo->velocities) {
-      buf = static_cast<struct commdata *>(vel_data);
-      for (i=0; i<nlocal; ++i) {
-        if (mask[i] & groupbit) {
-          buf[nme].tag = tag[i];
-          buf[nme].x   = v[i][0];
-          buf[nme].y   = v[i][1];
-          buf[nme].z   = v[i][2];
-          ++nme;
-        }
-      }
-    }
-    if (imdsinfo->forces) {
-      for (i=0; i<nlocal; ++i) {
-        if (mask[i] & groupbit) {
-          buf[nme].tag = tag[i];
-          buf[nme].x   = f[i][0];
-          buf[nme].y   = f[i][1];
-          buf[nme].z   = f[i][2];
-          ++nme;
-        }
-      }
-
-    }
-    /* blocking receive to wait until it is our turn to send data. */
-    MPI_Recv(&tmp, 0, MPI_INT, 0, 0, world, MPI_STATUS_IGNORE);
-    if (imdsinfo->coords) {
-      MPI_Rsend(coord_data, nme*size_one, MPI_BYTE, 0, 0, world);
-    }
-    if (imdsinfo->velocities) {
-      MPI_Rsend(vel_data, nme*size_one, MPI_BYTE, 0, 0, world);
-    }
-    if (imdsinfo->forces) {
-      MPI_Rsend(force_data, nme*size_one, MPI_BYTE, 0, 0, world);
-    }
-  }
-
 }
 
 /* End of FixIMD class implementation. */
